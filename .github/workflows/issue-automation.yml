@@ -86,6 +86,7 @@ jobs:
 
             const criticalKeywords = ['critical', 'urgent', 'production', 'outage'];
             const highKeywords = ['important', 'high', 'blocking'];
+            const mediumKeywords = ['medium', 'normal'];
             const lowKeywords = ['low', 'nice-to-have', 'minor'];
 
             function containsAny(keywords) {
@@ -96,6 +97,8 @@ jobs:
               priority = 'priority-critical';
             } else if (containsAny(highKeywords)) {
               priority = 'priority-high';
+            } else if (containsAny(mediumKeywords)) {
+              priority = 'priority-medium';
             } else if (containsAny(lowKeywords)) {
               priority = 'priority-low';
             }
@@ -139,6 +142,12 @@ jobs:
 
             const parentNumber = contextIssue.number;
             const originalTitle = contextIssue.title;
+            const parentBody = contextIssue.body || '';
+
+            if (parentBody.includes('## Epic Tasks')) {
+              core.info('Epic tasks already exist for this issue; skipping sub-issue creation.');
+              return;
+            }
 
             const tasks = [
               'Requirements Analysis',
@@ -177,7 +186,6 @@ Related to #${parentNumber}`;
             }
 
             // Update parent issue body with checklist.
-            const parentBody = contextIssue.body || '';
             const checklistLines = ['## Epic Tasks'];
             for (const number of createdIssues) {
               checklistLines.push(`- [ ] Task #${number}`);
@@ -245,10 +253,12 @@ Related to #${parentNumber}`;
                 repo: repo.repo,
                 state: 'all',
                 creator: author,
-                per_page: 2,
+                sort: 'created',
+                direction: 'asc',
+                per_page: 1,
               });
 
-              if (issues.length === 1 && issues[0].number === issue.number) {
+              if (issues.length > 0 && issues[0].number === issue.number) {
                 isFirstIssue = true;
               }
             } catch (error) {
