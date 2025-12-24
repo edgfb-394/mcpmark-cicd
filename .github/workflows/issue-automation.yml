@@ -24,9 +24,7 @@ jobs:
             const title = (issue.title || '').toLowerCase();
             const body = (issue.body || '').toLowerCase();
 
-            /**
-             * Ensure labels exist (idempotent) and collect their names to apply.
-             */
+            // Ensure labels exist (idempotent) and collect their names to apply.
             const labelsToEnsure = [
               { name: 'bug', description: "Something isn't working", color: 'd73a4a' },
               { name: 'enhancement', description: 'New feature or request', color: 'a2eeef' },
@@ -51,13 +49,17 @@ jobs:
               } catch (error) {
                 if (error.status === 404) {
                   core.info(`Creating missing label: ${label.name}`);
-                  await github.rest.issues.createLabel({
-                    owner: repo.owner,
-                    repo: repo.repo,
-                    name: label.name,
-                    color: label.color,
-                    description: label.description,
-                  });
+                  try {
+                    await github.rest.issues.createLabel({
+                      owner: repo.owner,
+                      repo: repo.repo,
+                      name: label.name,
+                      color: label.color,
+                      description: label.description,
+                    });
+                  } catch (createError) {
+                    core.warning(`Failed to create label ${label.name}: ${createError.message}`);
+                  }
                 } else {
                   core.warning(`Failed to ensure label ${label.name}: ${error.message}`);
                 }
@@ -65,11 +67,10 @@ jobs:
             }
 
             for (const label of labelsToEnsure) {
-              // Fire and forget; we don't want a single failure to break the whole workflow.
               await ensureLabel(label);
             }
 
-            const newLabels = new Set(issue.labels.map(l => l.name));
+            const newLabels = new Set((issue.labels || []).map(l => l.name));
 
             // All issues get needs-triage initially.
             newLabels.add('needs-triage');
@@ -107,12 +108,16 @@ jobs:
             }
             newLabels.add(priority);
 
-            await github.rest.issues.update({
-              owner: repo.owner,
-              repo: repo.repo,
-              issue_number: issue.number,
-              labels: Array.from(newLabels),
-            });
+            try {
+              await github.rest.issues.update({
+                owner: repo.owner,
+                repo: repo.repo,
+                issue_number: issue.number,
+                labels: Array.from(newLabels),
+              });
+            } catch (error) {
+              core.warning(`Failed to update issue labels during triage: ${error.message}`);
+            }
 
   task-breakdown:
     needs: issue-triage
@@ -151,15 +156,24 @@ jobs:
 
 Related to #${parentNumber}`;
 
-              const { data: subIssue } = await github.rest.issues.create({
-                owner: repo.owner,
-                repo: repo.repo,
-                title,
-                body,
-                labels: ['enhancement', 'needs-review'],
-              });
+              try {
+                const { data: subIssue } = await github.rest.issues.create({
+                  owner: repo.owner,
+                  repo: repo.repo,
+                  title,
+                  body,
+                  labels: ['enhancement', 'needs-review'],
+                });
 
-              createdIssues.push(subIssue.number);
+                createdIssues.push(subIssue.number);
+              } catch (error) {
+                core.warning(`Failed to create sub-issue for task "${taskName}": ${error.message}`);
+              }
+            }
+
+            if (createdIssues.length === 0) {
+              core.warning('No sub-issues were created for this epic.');
+              return;
             }
 
             // Update parent issue body with checklist.
@@ -173,12 +187,16 @@ Related to #${parentNumber}`;
               ? parentBody
               : `${parentBody}\n\n${checklistLines.join('\n')}`;
 
-            await github.rest.issues.update({
-              owner: repo.owner,
-              repo: repo.repo,
-              issue_number: parentNumber,
-              body: newBody,
-            });
+            try {
+              await github.rest.issues.update({
+                owner: repo.owner,
+                repo: repo.repo,
+                issue_number: parentNumber,
+                body: newBody,
+              });
+            } catch (error) {
+              core.warning(`Failed to update parent epic body: ${error.message}`);
+            }
 
   auto-response:
     needs: [issue-triage, task-breakdown]
@@ -189,15 +207,35 @@ Related to #${parentNumber}`;
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const issue = context.payload.issue;
+            const payloadIssue = context.payload.issue;
             const repo = context.repo;
 
-            if (!issue || issue.pull_request) {
+            if (!payloadIssue || payloadIssue.pull_request) {
               core.info('Not an issue event, skipping.');
               return;
             }
 
-            const author = issue.user.login;
+            const issueNumber = payloadIssue.number;
+
+            // Fetch the latest issue state to ensure we see labels applied by previous jobs.
+            let issue;
+            try {
+              const { data } = await github.rest.issues.get({
+                owner: repo.owner,
+                repo: repo.repo,
+                issue_number: issueNumber,
+              });
+              issue = data;
+            } catch (error) {
+              core.warning(`Unable to load latest issue state: ${error.message}`);
+              return;
+            }
+
+            const author = issue.user && issue.user.login;
+            if (!author) {
+              core.warning('Issue author is missing; skipping auto-response.');
+              return;
+            }
 
             // Determine if this is the author's first issue in this repo.
             let isFirstIssue = false;
@@ -217,10 +255,14 @@ Related to #${parentNumber}`;
               core.warning(`Unable to determine first-time contributor status: ${error.message}`);
             }
 
-            const existingLabels = new Set(issue.labels.map(l => l.name));
+            const existingLabels = new Set(
+              (issue.labels || [])
+                .map(l => (typeof l === 'string' ? l : l.name))
+                .filter(Boolean)
+            );
             const newLabels = new Set(existingLabels);
 
-            let bodyLines = [];
+            const bodyLines = [];
 
             if (isFirstIssue) {
               newLabels.add('first-time-contributor');
@@ -240,12 +282,16 @@ Related to #${parentNumber}`;
             }
 
             if (bodyLines.length > 0) {
-              await github.rest.issues.createComment({
-                owner: repo.owner,
-                repo: repo.repo,
-                issue_number: issue.number,
-                body: bodyLines.join('\n\n'),
-              });
+              try {
+                await github.rest.issues.createComment({
+                  owner: repo.owner,
+                  repo: repo.repo,
+                  issue_number: issue.number,
+                  body: bodyLines.join('\n\n'),
+                });
+              } catch (error) {
+                core.warning(`Failed to create auto-response comment: ${error.message}`);
+              }
             }
 
             // Milestone handling for high priority issues.
@@ -276,24 +322,32 @@ Related to #${parentNumber}`;
               }
 
               if (milestoneId) {
-                await github.rest.issues.update({
-                  owner: repo.owner,
-                  repo: repo.repo,
-                  issue_number: issue.number,
-                  milestone: milestoneId,
-                });
+                try {
+                  await github.rest.issues.update({
+                    owner: repo.owner,
+                    repo: repo.repo,
+                    issue_number: issue.number,
+                    milestone: milestoneId,
+                  });
+                } catch (error) {
+                  core.warning(`Failed to assign milestone v1.0.0: ${error.message}`);
+                }
               }
             }
 
-            // Change status from needs-triage to needs-review.
+            // Change status from needs-triage to needs-review after response.
             if (newLabels.has('needs-triage')) {
               newLabels.delete('needs-triage');
             }
             newLabels.add('needs-review');
 
-            await github.rest.issues.update({
-              owner: repo.owner,
-              repo: repo.repo,
-              issue_number: issue.number,
-              labels: Array.from(newLabels),
-            });
+            try {
+              await github.rest.issues.update({
+                owner: repo.owner,
+                repo: repo.repo,
+                issue_number: issue.number,
+                labels: Array.from(newLabels),
+              });
+            } catch (error) {
+              core.warning(`Unable to update issue status labels: ${error.message}`);
+            }
